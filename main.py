@@ -43,7 +43,7 @@ ctk.set_default_color_theme("blue")
 class PentestAI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Pentest AI – Professional Suite")
+        self.title("Parrot AI – Professional Suite")
         self.geometry("1400x920")
         self.minsize(1200, 700)
 
@@ -250,7 +250,7 @@ class PentestAI(ctk.CTk):
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", size=12)
-        pdf.cell(200, 10, txt=f"Pentest AI Conversation Report - {tab_key}", ln=1, align='C')
+        pdf.cell(200, 10, txt=f"Parrot AI Conversation Report - {tab_key}", ln=1, align='C')
         pdf.ln(10)
         for role, msg in history:
             pdf.set_font("Arial", 'B', 11)
@@ -386,7 +386,7 @@ class PentestAI(ctk.CTk):
         self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
         self.sidebar.grid_propagate(False)
 
-        ctk.CTkLabel(self.sidebar, text="PENTEST AI", font=("Orbitron", 28, "bold"),
+        ctk.CTkLabel(self.sidebar, text="PARROT AI", font=("Orbitron", 28, "bold"),
                      text_color=self.text_glow).pack(pady=(40, 10))
         ctk.CTkLabel(self.sidebar, text="SECURE AI FRAMEWORK", font=("Segoe UI", 10),
                      text_color=self.text_dim).pack()
@@ -472,7 +472,7 @@ class PentestAI(ctk.CTk):
 
         header = ctk.CTkFrame(scroll, fg_color="transparent")
         header.pack(fill="x", pady=(0, 20))
-        ctk.CTkLabel(header, text="PENTEST AI DASHBOARD", font=("Orbitron", 28, "bold"),
+        ctk.CTkLabel(header, text="PARROT AI DASHBOARD", font=("Orbitron", 28, "bold"),
                      text_color=self.text_glow).pack(side="left")
         self.clock_lbl = ctk.CTkLabel(header, text="", font=("JetBrains Mono", 14, "bold"),
                                       text_color=self.accent_blue)
@@ -547,7 +547,7 @@ class PentestAI(ctk.CTk):
 
     def _generate_initial_logs(self):
         return "\n".join([
-            f"> [{time.strftime('%H:%M:%S')}] PENTEST AI v1.0 INITIALIZED",
+            f"> [{time.strftime('%H:%M:%S')}] PARROT AI v1.0 INITIALIZED",
             f"> [{time.strftime('%H:%M:%S')}] NODE AUTHENTICATED: {socket.gethostname()}",
             f"> [{time.strftime('%H:%M:%S')}] AI BRIDGE ONLINE",
             f"> [{time.strftime('%H:%M:%S')}] MONITORING ACTIVE"

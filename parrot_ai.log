@@ -1,0 +1,4 @@
+2026-04-18 08:04:20,470 - INFO - ChromaDB initialized with Ollama embedding
+2026-04-18 08:46:04,184 - INFO - ChromaDB initialized with Ollama embedding
+2026-04-18 08:46:45,911 - INFO - HTTP Request: POST http://localhost:11434/api/embed "HTTP/1.1 200 OK"
+2026-04-18 08:48:29,313 - INFO - HTTP Request: POST http://localhost:11434/api/embed "HTTP/1.1 200 OK"

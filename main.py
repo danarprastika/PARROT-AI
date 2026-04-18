@@ -11,18 +11,71 @@ import platform
 import json
 import shutil
 import requests
+import subprocess
+import sys
+import webbrowser
+import urllib.request
+import logging
 from datetime import datetime
 from tkinter import filedialog, messagebox
 from core.engine import LocalAI
 from core.executor import run_parrot_tool
-from utils.monitor import get_system_stats, get_hard_specs
+from utils.monitor import get_system_stats, get_hard_specs, get_top_processes, get_network_interfaces, get_disk_partitions
+from utils.helpers import format_uptime, clean_ai_response, safe_filename
 import schedule
 import pytz
 from fpdf import FPDF
 
-# ----------------------------- OPTIONAL -----------------------------
-OCR_AVAILABLE = False
-MATPLOTLIB_AVAILABLE = False
+# ----------------------------- LOGGING -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='parrot_ai.log',
+    filemode='a'
+)
+logger = logging.getLogger(__name__)
+
+# ----------------------------- KONFIGURASI GLOBAL -----------------------------
+CONFIG_FILE = "config.json"
+DEFAULT_CONFIG = {
+    "model": "dolphin-llama3",
+    "graph": False,
+    "ocr": False,
+    "vt_key": "",
+    "abuse_key": ""
+}
+
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, "r") as f:
+        CONFIG = json.load(f)
+else:
+    CONFIG = DEFAULT_CONFIG.copy()
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(CONFIG, f)
+
+OCR_AVAILABLE = CONFIG.get("ocr", False)
+MATPLOTLIB_AVAILABLE = CONFIG.get("graph", False)
+VT_API_KEY = CONFIG.get("vt_key", "")
+ABUSEIPDB_API_KEY = CONFIG.get("abuse_key", "")
+
+if OCR_AVAILABLE:
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        OCR_AVAILABLE = False
+        logger.warning("OCR disabled (install pytesseract pillow)")
+
+if MATPLOTLIB_AVAILABLE:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        import matplotlib.pyplot as plt
+    except ImportError:
+        MATPLOTLIB_AVAILABLE = False
+        logger.warning("Matplotlib disabled (install matplotlib)")
 
 # ChromaDB RAG
 try:
@@ -31,19 +84,15 @@ try:
     CHROMADB_AVAILABLE = True
 except ImportError:
     CHROMADB_AVAILABLE = False
-    print("ChromaDB not installed. RAG feature disabled.")
-
-# Threat Intel API Keys (isi jika punya)
-VT_API_KEY = ""
-ABUSEIPDB_API_KEY = ""
+    logger.warning("ChromaDB not installed. RAG feature disabled.")
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-class PentestAI(ctk.CTk):
+class ParrotAI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Parrot AI – Professional Suite")
+        self.title("PARROT AI – Professional Suite")
         self.geometry("1400x920")
         self.minsize(1200, 700)
 
@@ -68,12 +117,15 @@ class PentestAI(ctk.CTk):
         }
 
         self.configure(fg_color=self.bg_black)
-        self.ai = LocalAI()
+        self.ai = LocalAI(model_name=CONFIG["model"])
         self.is_processing = False
         self.cancel_event = threading.Event()
+        self._semaphore = threading.Semaphore(3)
         self.terminals = {}
         self.engine_counts = {"HEXSEC": 0, "WORM": 0, "PENTEST": 0}
         self.scheduled_jobs = []
+        self.command_history = []
+        self.history_index = 0
 
         # Database
         self.init_sqlite()
@@ -83,7 +135,7 @@ class PentestAI(ctk.CTk):
         else:
             self.chroma_collection = None
 
-        # Network arsenal toolkit (lengkap)
+        # Network arsenal toolkit
         self.network_tools = self._build_toolkit()
         self.filtered_tools = self.network_tools.copy()
 
@@ -91,10 +143,72 @@ class PentestAI(ctk.CTk):
         self.start_monitoring()
         self.start_dashboard_updates()
         self.start_scheduler()
+        self.after(5000, self.check_update)
+
+    # ----------------------------- OLLAMA CHECK -----------------------------
+    def check_ollama_installation(self):
+        try:
+            subprocess.run(["ollama", "--version"], capture_output=True, check=True)
+            response = requests.get("http://localhost:11434/api/tags", timeout=3)
+            if response.status_code == 200:
+                return True
+            else:
+                messagebox.showwarning("Ollama", "Ollama terinstal tetapi server tidak berjalan. Silakan jalankan 'ollama serve'.")
+                return False
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            answer = messagebox.askyesno(
+                "Ollama Tidak Ditemukan",
+                "Ollama diperlukan untuk menjalankan AI. Apakah Anda ingin menginstal Ollama sekarang?\n\n"
+                "Klik Yes untuk instalasi otomatis (membutuhkan koneksi internet).\n"
+                "Klik No untuk membuka halaman unduhan Ollama."
+            )
+            if answer:
+                self.install_ollama()
+                return False
+            else:
+                webbrowser.open("https://ollama.com/download")
+                messagebox.showinfo("Instalasi", "Silakan instal Ollama secara manual, lalu restart aplikasi.")
+                return False
+        except requests.ConnectionError:
+            messagebox.showerror("Koneksi", "Ollama server tidak merespon. Pastikan Ollama sudah dijalankan (ollama serve).")
+            return False
+
+    def install_ollama(self):
+        system = platform.system().lower()
+        if system == "windows":
+            url = "https://ollama.com/download/OllamaSetup.exe"
+            installer_path = os.path.join(os.environ['TEMP'], "OllamaSetup.exe")
+            messagebox.showinfo("Instalasi", "Mengunduh Ollama untuk Windows...")
+            try:
+                urllib.request.urlretrieve(url, installer_path)
+                subprocess.run([installer_path, "/S"], check=True)
+                messagebox.showinfo("Sukses", "Ollama telah terinstal. Silakan restart aplikasi.")
+                self.quit()
+            except Exception as e:
+                messagebox.showerror("Error", f"Gagal menginstal Ollama: {e}\nSilakan unduh manual dari https://ollama.com/download")
+                self.quit()
+        elif system == "linux":
+            answer = messagebox.askyesno(
+                "Instalasi Ollama",
+                "Proses instalasi akan menggunakan 'curl' dan memerlukan hak sudo.\nLanjutkan?"
+            )
+            if answer:
+                try:
+                    subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True)
+                    messagebox.showinfo("Sukses", "Ollama telah terinstal. Silakan jalankan 'ollama serve' di terminal, lalu restart aplikasi.")
+                    self.quit()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Gagal menginstal Ollama: {e}")
+                    self.quit()
+        else:
+            webbrowser.open("https://ollama.com/download")
+            messagebox.showinfo("Instalasi", "Silakan unduh Ollama untuk macOS dari situs resmi, lalu restart aplikasi.")
+            self.quit()
+        self.quit()
 
     # ----------------------------- DATABASE -----------------------------
     def init_sqlite(self):
-        self.conn = sqlite3.connect('pentest_memory.db', check_same_thread=False)
+        self.conn = sqlite3.connect('parrot_memory.db', check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS conversations (
@@ -123,7 +237,7 @@ class PentestAI(ctk.CTk):
         return list(reversed(rows))
 
     def init_audit_db(self):
-        self.audit_conn = sqlite3.connect('pentest_audit.db', check_same_thread=False)
+        self.audit_conn = sqlite3.connect('parrot_audit.db', check_same_thread=False)
         self.audit_cursor = self.audit_conn.cursor()
         self.audit_cursor.execute('''
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -148,7 +262,7 @@ class PentestAI(ctk.CTk):
             )
             self.audit_conn.commit()
         except Exception as e:
-            print(f"Audit log error: {e}")
+            logger.error(f"Audit log error: {e}")
 
     # ----------------------------- CHROMADB RAG -----------------------------
     def init_chromadb(self):
@@ -157,7 +271,7 @@ class PentestAI(ctk.CTk):
                 model_name="nomic-embed-text",
                 url="http://localhost:11434/api/embeddings"
             )
-            self.chroma_client = chromadb.PersistentClient(path="./pentest_knowledge")
+            self.chroma_client = chromadb.PersistentClient(path="./parrot_knowledge")
             try:
                 self.chroma_client.delete_collection("knowledge_base")
             except:
@@ -166,9 +280,9 @@ class PentestAI(ctk.CTk):
                 name="knowledge_base",
                 embedding_function=self.embedding_fn
             )
-            print("ChromaDB initialized with Ollama embedding")
+            logger.info("ChromaDB initialized with Ollama embedding")
         except Exception as e:
-            print(f"ChromaDB init failed: {e}")
+            logger.error(f"ChromaDB init failed: {e}")
             self.chroma_collection = None
 
     def add_to_knowledge_base(self, file_path, tab_key):
@@ -197,7 +311,7 @@ class PentestAI(ctk.CTk):
                 return "\n\n".join(results['documents'][0])
             return ""
         except Exception as e:
-            print(f"Query error: {e}")
+            logger.error(f"Query error: {e}")
             return ""
 
     # ----------------------------- THREAT INTEL -----------------------------
@@ -235,7 +349,7 @@ class PentestAI(ctk.CTk):
         except Exception as e:
             return f"Request failed: {e}"
 
-    # ----------------------------- EXPORT PDF -----------------------------
+    # ----------------------------- EXPORT PDF & JSON -----------------------------
     def export_conversation_pdf(self, tab_key):
         if tab_key not in self.terminals:
             messagebox.showerror("Error", "No active terminal")
@@ -250,7 +364,7 @@ class PentestAI(ctk.CTk):
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", size=12)
-        pdf.cell(200, 10, txt=f"Parrot AI Conversation Report - {tab_key}", ln=1, align='C')
+        pdf.cell(200, 10, txt=f"PARROT AI Conversation Report - {tab_key}", ln=1, align='C')
         pdf.ln(10)
         for role, msg in history:
             pdf.set_font("Arial", 'B', 11)
@@ -262,14 +376,31 @@ class PentestAI(ctk.CTk):
         messagebox.showinfo("Success", f"Report exported to {file_path}")
         self.log_audit("export_report", tab_key, file_path)
 
+    def export_conversation_json(self, tab_key):
+        if tab_key not in self.terminals:
+            messagebox.showerror("Error", "No active terminal")
+            return
+        history = self.get_conversation_history(tab_key, limit=100)
+        if not history:
+            messagebox.showinfo("Info", "No conversation history to export")
+            return
+        file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+        if not file_path:
+            return
+        data = [{"role": role, "message": msg} for role, msg in history]
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        messagebox.showinfo("Success", f"Exported to {file_path}")
+        self.log_audit("export_json", tab_key, file_path)
+
     # ----------------------------- BACKUP & RESTORE -----------------------------
     def backup_data(self):
-        backup_dir = f"pentest_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        backup_dir = f"parrot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         os.makedirs(backup_dir, exist_ok=True)
-        shutil.copy2('pentest_memory.db', os.path.join(backup_dir, 'pentest_memory.db'))
-        shutil.copy2('pentest_audit.db', os.path.join(backup_dir, 'pentest_audit.db'))
-        if os.path.exists('./pentest_knowledge'):
-            shutil.copytree('./pentest_knowledge', os.path.join(backup_dir, 'pentest_knowledge'))
+        shutil.copy2('parrot_memory.db', os.path.join(backup_dir, 'parrot_memory.db'))
+        shutil.copy2('parrot_audit.db', os.path.join(backup_dir, 'parrot_audit.db'))
+        if os.path.exists('./parrot_knowledge'):
+            shutil.copytree('./parrot_knowledge', os.path.join(backup_dir, 'parrot_knowledge'))
         with open(os.path.join(backup_dir, 'config.json'), 'w') as f:
             json.dump({"theme": self.current_theme}, f)
         messagebox.showinfo("Backup", f"Backup completed: {backup_dir}")
@@ -280,11 +411,11 @@ class PentestAI(ctk.CTk):
         if not backup_dir:
             return
         try:
-            shutil.copy2(os.path.join(backup_dir, 'pentest_memory.db'), 'pentest_memory.db')
-            shutil.copy2(os.path.join(backup_dir, 'pentest_audit.db'), 'pentest_audit.db')
-            if os.path.exists(os.path.join(backup_dir, 'pentest_knowledge')):
-                shutil.rmtree('./pentest_knowledge', ignore_errors=True)
-                shutil.copytree(os.path.join(backup_dir, 'pentest_knowledge'), './pentest_knowledge')
+            shutil.copy2(os.path.join(backup_dir, 'parrot_memory.db'), 'parrot_memory.db')
+            shutil.copy2(os.path.join(backup_dir, 'parrot_audit.db'), 'parrot_audit.db')
+            if os.path.exists(os.path.join(backup_dir, 'parrot_knowledge')):
+                shutil.rmtree('./parrot_knowledge', ignore_errors=True)
+                shutil.copytree(os.path.join(backup_dir, 'parrot_knowledge'), './parrot_knowledge')
             with open(os.path.join(backup_dir, 'config.json'), 'r') as f:
                 config = json.load(f)
                 self.current_theme = config.get('theme', 'dark')
@@ -337,7 +468,56 @@ class PentestAI(ctk.CTk):
                 messagebox.showerror("Error", "Interval must be number")
         ctk.CTkButton(dialog, text="Add", command=add).pack(pady=10)
 
-    # ----------------------------- OLLAMA MODEL MANAGER -----------------------------
+    # ----------------------------- SETTINGS -----------------------------
+    def show_settings(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Settings")
+        dialog.geometry("500x500")
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Ollama Model:").pack(pady=5)
+        model_var = ctk.StringVar(value=self.ai.model)
+        model_entry = ctk.CTkEntry(dialog, textvariable=model_var, width=300)
+        model_entry.pack(pady=5)
+
+        graph_var = ctk.BooleanVar(value=MATPLOTLIB_AVAILABLE)
+        ctk.CTkCheckBox(dialog, text="Enable Graphs (restart required)", variable=graph_var).pack(pady=5)
+
+        ocr_var = ctk.BooleanVar(value=OCR_AVAILABLE)
+        ctk.CTkCheckBox(dialog, text="Enable OCR (install pytesseract)", variable=ocr_var).pack(pady=5)
+
+        ctk.CTkLabel(dialog, text="AbuseIPDB API Key:").pack(pady=5)
+        abuse_entry = ctk.CTkEntry(dialog, width=300)
+        abuse_entry.pack(pady=5)
+        abuse_entry.insert(0, ABUSEIPDB_API_KEY)
+
+        ctk.CTkLabel(dialog, text="VirusTotal API Key:").pack(pady=5)
+        vt_entry = ctk.CTkEntry(dialog, width=300)
+        vt_entry.pack(pady=5)
+        vt_entry.insert(0, VT_API_KEY)
+
+        def save():
+            global MATPLOTLIB_AVAILABLE, OCR_AVAILABLE, VT_API_KEY, ABUSEIPDB_API_KEY, CONFIG
+            self.ai.model = model_var.get()
+            MATPLOTLIB_AVAILABLE = graph_var.get()
+            OCR_AVAILABLE = ocr_var.get()
+            VT_API_KEY = vt_entry.get()
+            ABUSEIPDB_API_KEY = abuse_entry.get()
+            CONFIG.update({
+                "model": self.ai.model,
+                "graph": MATPLOTLIB_AVAILABLE,
+                "ocr": OCR_AVAILABLE,
+                "vt_key": VT_API_KEY,
+                "abuse_key": ABUSEIPDB_API_KEY
+            })
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(CONFIG, f)
+            messagebox.showinfo("Settings", "Saved. Please restart app for changes to take effect.")
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="Save", command=save).pack(pady=20)
+
+    # ----------------------------- MODEL MANAGER -----------------------------
     def get_ollama_models(self):
         try:
             response = requests.get("http://localhost:11434/api/tags", timeout=5)
@@ -376,6 +556,30 @@ class PentestAI(ctk.CTk):
                 dialog.destroy()
         ctk.CTkButton(dialog, text="Pull", command=pull).pack(pady=10)
 
+    # ----------------------------- THEME TOGGLE -----------------------------
+    def toggle_theme(self):
+        if self.current_theme == "dark":
+            ctk.set_appearance_mode("light")
+            self.current_theme = "light"
+        else:
+            ctk.set_appearance_mode("dark")
+            self.current_theme = "dark"
+        self.log_audit("theme_toggle", self.current_theme, "")
+
+    # ----------------------------- UPDATE CHECKER -----------------------------
+    def check_update(self):
+        try:
+            response = requests.get("https://api.github.com/repos/danarprastika/PARROT-AI/releases/latest", timeout=5)
+            if response.status_code == 200:
+                latest = response.json().get("tag_name", "v0.0")
+                if latest != "v1.0":
+                    answer = messagebox.askyesno("Update Available", 
+                        f"New version {latest} is available.\nDownload from GitHub?")
+                    if answer:
+                        webbrowser.open("https://github.com/danarprastika/PARROT-AI/releases/latest")
+        except:
+            pass
+
     # ----------------------------- UI SETUP -----------------------------
     def setup_ui(self):
         self.grid_columnconfigure(1, weight=1)
@@ -401,14 +605,15 @@ class PentestAI(ctk.CTk):
 
         extra_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         extra_frame.pack(fill="x", pady=20, padx=20)
-        # TOMBOL THEME DIHAPUS
         self._create_nav_btn("💾  BACKUP", self.backup_data, parent=extra_frame)
         self._create_nav_btn("📂  RESTORE", self.restore_data, parent=extra_frame)
         self._create_nav_btn("⏰  SCHEDULE", self.show_schedule_dialog, parent=extra_frame)
         self._create_nav_btn("🤖  MODEL MGR", self.show_model_manager, parent=extra_frame)
         self._create_nav_btn("📄  EXPORT PDF", lambda: self.export_conversation_pdf(self.engine_tabs.get()), parent=extra_frame)
+        self._create_nav_btn("📊  EXPORT JSON", lambda: self.export_conversation_json(self.engine_tabs.get()), parent=extra_frame)
+        self._create_nav_btn("⚙️  SETTINGS", self.show_settings, parent=extra_frame)
+        self._create_nav_btn("🌓  THEME", self.toggle_theme, parent=extra_frame)
 
-        # Status bar di sidebar (menampilkan CPU, RAM, dan TEMP)
         self.stat_container = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         self.stat_container.pack(side="bottom", fill="x", padx=20, pady=30)
         self.cpu_bar = ctk.CTkProgressBar(self.stat_container, height=4, progress_color=self.accent_blue)
@@ -416,7 +621,6 @@ class PentestAI(ctk.CTk):
         self.stat_text = ctk.CTkLabel(self.stat_container, text="CORE STATUS: IDLE",
                                       font=("Consolas", 10), text_color=self.text_dim)
         self.stat_text.pack()
-        # Tambahan label untuk suhu
         self.temp_label = ctk.CTkLabel(self.stat_container, text="🌡️ TEMP: --°C",
                                        font=("Consolas", 10), text_color=self.text_dim)
         self.temp_label.pack(pady=(5,0))
@@ -463,7 +667,7 @@ class PentestAI(ctk.CTk):
     def show_kernel(self):
         self.page_kernel.tkraise()
 
-    # ----------------------------- DASHBOARD (tanpa TEMP) -----------------------------
+    # ----------------------------- DASHBOARD -----------------------------
     def _build_dashboard(self):
         for w in self.page_dash.winfo_children():
             w.destroy()
@@ -472,71 +676,165 @@ class PentestAI(ctk.CTk):
 
         header = ctk.CTkFrame(scroll, fg_color="transparent")
         header.pack(fill="x", pady=(0, 20))
-        ctk.CTkLabel(header, text="PARROT AI DASHBOARD", font=("Orbitron", 28, "bold"),
+        ctk.CTkLabel(header, text="📊 SYSTEM DASHBOARD", font=("Orbitron", 28, "bold"),
                      text_color=self.text_glow).pack(side="left")
-        self.clock_lbl = ctk.CTkLabel(header, text="", font=("JetBrains Mono", 14, "bold"),
+        info_frame = ctk.CTkFrame(header, fg_color="transparent")
+        info_frame.pack(side="right")
+        self.clock_lbl = ctk.CTkLabel(info_frame, text="", font=("JetBrains Mono", 14, "bold"),
                                       text_color=self.accent_blue)
-        self.clock_lbl.pack(side="right")
+        self.clock_lbl.pack(anchor="e")
+        self.uptime_lbl = ctk.CTkLabel(info_frame, text="Uptime: --h --m", font=("Consolas", 11),
+                                       text_color=self.text_dim)
+        self.uptime_lbl.pack(anchor="e")
         self._update_clock()
+        self._update_uptime()
 
-        # Metric cards (7 kartu, tanpa TEMP)
+        # Metric cards (7 kartu, 1 baris)
         metrics_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         metrics_frame.pack(fill="x", pady=10)
         for i in range(7):
-            metrics_frame.grid_columnconfigure(i, weight=1)
+            metrics_frame.grid_columnconfigure(i, weight=1, uniform="metric_col")
+
         self.metric_labels = {}
-        names = ["CPU", "RAM", "DISK", "NET_IO", "UPTIME", "THREADS", "BATTERY"]
-        icons = ["💻", "🧠", "💾", "🌐", "⏱️", "⚙️", "🔋"]
-        for idx, (name, icon) in enumerate(zip(names, icons)):
-            card = ctk.CTkFrame(metrics_frame, fg_color=self.card_bg, border_width=1,
-                                border_color=self.border_col, corner_radius=12, height=100)
-            card.grid(row=0, column=idx, padx=5, sticky="nsew")
+        self.metric_progress = {}
+        metric_data = [
+            ("CPU", "💻", self.accent_blue, True),
+            ("RAM", "🧠", self.accent_green, True),
+            ("DISK", "💾", self.accent_orange, True),
+            ("NET_IO", "🌐", self.accent_blue, False),
+            ("UPTIME", "⏱️", self.accent_green, False),
+            ("THREADS", "⚙️", self.accent_orange, False),
+            ("BATTERY", "🔋", self.accent_green, True)
+        ]
+        for idx, (name, icon, color, has_progress) in enumerate(metric_data):
+            card = ctk.CTkFrame(metrics_frame, fg_color=self.card_bg, corner_radius=15,
+                                border_width=1, border_color=self.border_col)
+            card.grid(row=0, column=idx, padx=6, pady=8, sticky="nsew")
+            card.configure(height=150)
             card.grid_propagate(False)
-            ctk.CTkLabel(card, text=f"{icon} {name}", font=("Segoe UI", 11, "bold"),
+            ctk.CTkLabel(card, text=f"{icon} {name}", font=("Segoe UI", 12, "bold"),
                          text_color=self.text_dim).pack(pady=(12, 5))
-            val_lbl = ctk.CTkLabel(card, text="--", font=("Orbitron", 16, "bold"), text_color=self.text_main)
+            val_lbl = ctk.CTkLabel(card, text="--", font=("Orbitron", 20, "bold"),
+                                   text_color=color)
             val_lbl.pack()
             self.metric_labels[name] = val_lbl
-            ctk.CTkFrame(card, height=2, fg_color=self.accent_blue if idx%2==0 else self.accent_green, width=80).pack(side="bottom", pady=12)
+            if has_progress:
+                prog = ctk.CTkProgressBar(card, height=8, progress_color=color,
+                                          fg_color="#202226", corner_radius=4)
+                prog.pack(fill="x", padx=20, pady=(12, 15))
+                prog.set(0)
+                self.metric_progress[name] = prog
+            else:
+                ctk.CTkFrame(card, height=8, fg_color="transparent").pack(pady=(12, 15))
 
-        # Top Processes & Alerts (sama)
-        mid = ctk.CTkFrame(scroll, fg_color="transparent")
-        mid.pack(fill="x", pady=15)
-        mid.grid_columnconfigure(0, weight=2)
-        mid.grid_columnconfigure(1, weight=1)
-        proc_frame = ctk.CTkFrame(mid, fg_color=self.card_bg, border_width=1, border_color=self.border_col, corner_radius=12)
-        proc_frame.grid(row=0, column=0, padx=5, sticky="nsew")
-        ctk.CTkLabel(proc_frame, text="TOP PROCESSES", font=("Orbitron", 12, "bold"), text_color=self.accent_orange).pack(pady=(12,8), anchor="w", padx=20)
-        self.proc_text = ctk.CTkTextbox(proc_frame, font=("Consolas", 10), fg_color="#08080a", text_color="#00ffaa", height=150)
-        self.proc_text.pack(fill="both", expand=True, padx=20, pady=(0,15))
-        alert_frame = ctk.CTkFrame(mid, fg_color=self.card_bg, border_width=1, border_color=self.border_col, corner_radius=12)
-        alert_frame.grid(row=0, column=1, padx=5, sticky="nsew")
-        ctk.CTkLabel(alert_frame, text="SYSTEM ALERTS", font=("Orbitron", 12, "bold"), text_color=self.accent_red).pack(pady=(12,8), anchor="w", padx=20)
-        self.alert_text = ctk.CTkTextbox(alert_frame, font=("Consolas", 10), fg_color="#08080a", text_color="#ff6666", height=150)
-        self.alert_text.pack(fill="both", expand=True, padx=20, pady=(0,15))
-        self.alert_text.insert("end", "> No active alerts.\n")
+        # Grafik (opsional)
+        if MATPLOTLIB_AVAILABLE:
+            charts_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+            charts_frame.pack(fill="x", pady=15)
+            charts_frame.grid_columnconfigure(0, weight=1)
+            charts_frame.grid_columnconfigure(1, weight=1)
+
+            cpu_card = ctk.CTkFrame(charts_frame, fg_color=self.card_bg, corner_radius=15,
+                                    border_width=1, border_color=self.border_col)
+            cpu_card.grid(row=0, column=0, padx=8, sticky="nsew")
+            cpu_card.configure(height=260)
+            cpu_card.grid_propagate(False)
+            ctk.CTkLabel(cpu_card, text="📈 CPU USAGE HISTORY", font=("Orbitron", 12, "bold"),
+                         text_color=self.accent_blue).pack(pady=(12, 0))
+            self.cpu_fig = Figure(figsize=(4.5, 2.5), dpi=90, facecolor=self.card_bg)
+            self.cpu_ax = self.cpu_fig.add_subplot(111)
+            self.cpu_ax.set_facecolor(self.card_bg)
+            self.cpu_ax.tick_params(colors=self.text_dim)
+            self.cpu_ax.set_xlabel("Time (s)", color=self.text_dim, fontsize=8)
+            self.cpu_ax.set_ylabel("%", color=self.text_dim, fontsize=8)
+            self.cpu_line, = self.cpu_ax.plot([], [], color=self.accent_blue, linewidth=2)
+            self.cpu_ax.set_ylim(0, 100)
+            self.cpu_history = [0] * 30
+            self.cpu_canvas = FigureCanvasTkAgg(self.cpu_fig, master=cpu_card)
+            self.cpu_canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+
+            ram_card = ctk.CTkFrame(charts_frame, fg_color=self.card_bg, corner_radius=15,
+                                    border_width=1, border_color=self.border_col)
+            ram_card.grid(row=0, column=1, padx=8, sticky="nsew")
+            ram_card.configure(height=260)
+            ram_card.grid_propagate(False)
+            ctk.CTkLabel(ram_card, text="🍕 RAM USAGE", font=("Orbitron", 12, "bold"),
+                         text_color=self.accent_green).pack(pady=(12, 0))
+            self.ram_fig = Figure(figsize=(4.5, 2.5), dpi=90, facecolor=self.card_bg)
+            self.ram_ax = self.ram_fig.add_subplot(111)
+            self.ram_ax.set_facecolor(self.card_bg)
+            self.ram_canvas = FigureCanvasTkAgg(self.ram_fig, master=ram_card)
+            self.ram_canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Top Processes & Alerts
+        mid_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        mid_row.pack(fill="x", pady=10)
+        mid_row.grid_columnconfigure(0, weight=2)
+        mid_row.grid_columnconfigure(1, weight=1)
+
+        proc_card = ctk.CTkFrame(mid_row, fg_color=self.card_bg, corner_radius=15,
+                                 border_width=1, border_color=self.border_col)
+        proc_card.grid(row=0, column=0, padx=8, sticky="nsew")
+        proc_card.configure(height=220)
+        proc_card.grid_propagate(False)
+        ctk.CTkLabel(proc_card, text="⚡ TOP PROCESSES", font=("Orbitron", 12, "bold"),
+                     text_color=self.accent_orange).pack(pady=(12, 8), anchor="w", padx=20)
+        self.proc_text = ctk.CTkTextbox(proc_card, font=("Consolas", 11), fg_color="#08080a",
+                                        text_color="#00ffaa")
+        self.proc_text.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+        alert_card = ctk.CTkFrame(mid_row, fg_color=self.card_bg, corner_radius=15,
+                                  border_width=1, border_color=self.border_col)
+        alert_card.grid(row=0, column=1, padx=8, sticky="nsew")
+        alert_card.configure(height=220)
+        alert_card.grid_propagate(False)
+        ctk.CTkLabel(alert_card, text="⚠️ SYSTEM ALERTS", font=("Orbitron", 12, "bold"),
+                     text_color=self.accent_red).pack(pady=(12, 8), anchor="w", padx=20)
+        self.alert_text = ctk.CTkTextbox(alert_card, font=("Consolas", 11), fg_color="#08080a",
+                                         text_color="#ff6666")
+        self.alert_text.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        self.alert_text.insert("end", "✅ No active alerts.\n")
         self.alert_text.configure(state="disabled")
 
-        net_disk = ctk.CTkFrame(scroll, fg_color="transparent")
-        net_disk.pack(fill="x", pady=10)
-        net_disk.grid_columnconfigure(0, weight=1)
-        net_disk.grid_columnconfigure(1, weight=1)
-        net_card = ctk.CTkFrame(net_disk, fg_color=self.card_bg, border_width=1, border_color=self.border_col, corner_radius=12)
-        net_card.grid(row=0, column=0, padx=5, sticky="nsew")
-        ctk.CTkLabel(net_card, text="NETWORK INTERFACES", font=("Orbitron", 12, "bold"), text_color=self.accent_blue).pack(pady=(12,8), anchor="w", padx=20)
-        self.net_text = ctk.CTkTextbox(net_card, font=("Consolas", 10), fg_color="#08080a", text_color=self.text_main, height=100)
-        self.net_text.pack(fill="both", expand=True, padx=20, pady=(0,15))
-        disk_card = ctk.CTkFrame(net_disk, fg_color=self.card_bg, border_width=1, border_color=self.border_col, corner_radius=12)
-        disk_card.grid(row=0, column=1, padx=5, sticky="nsew")
-        ctk.CTkLabel(disk_card, text="DISK USAGE", font=("Orbitron", 12, "bold"), text_color=self.accent_green).pack(pady=(12,8), anchor="w", padx=20)
-        self.disk_text = ctk.CTkTextbox(disk_card, font=("Consolas", 10), fg_color="#08080a", text_color=self.text_main, height=100)
-        self.disk_text.pack(fill="both", expand=True, padx=20, pady=(0,15))
+        # Network & Disk
+        net_disk_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        net_disk_row.pack(fill="x", pady=10)
+        net_disk_row.grid_columnconfigure(0, weight=1)
+        net_disk_row.grid_columnconfigure(1, weight=1)
 
-        log_card = ctk.CTkFrame(scroll, fg_color=self.card_bg, border_width=1, border_color=self.border_col, corner_radius=12)
-        log_card.pack(fill="x", pady=15)
-        ctk.CTkLabel(log_card, text="SYSTEM EVENT LOG", font=("Orbitron", 12, "bold"), text_color=self.accent_red).pack(pady=(12,8), anchor="w", padx=20)
-        self.log_textbox = ctk.CTkTextbox(log_card, font=("Consolas", 10), fg_color="#08080a", text_color=self.accent_green, height=150)
-        self.log_textbox.pack(fill="both", expand=True, padx=20, pady=(0,15))
+        net_card = ctk.CTkFrame(net_disk_row, fg_color=self.card_bg, corner_radius=15,
+                                border_width=1, border_color=self.border_col)
+        net_card.grid(row=0, column=0, padx=8, sticky="nsew")
+        net_card.configure(height=160)
+        net_card.grid_propagate(False)
+        ctk.CTkLabel(net_card, text="🌐 NETWORK INTERFACES", font=("Orbitron", 12, "bold"),
+                     text_color=self.accent_blue).pack(pady=(12, 8), anchor="w", padx=20)
+        self.net_text = ctk.CTkTextbox(net_card, font=("Consolas", 10), fg_color="#08080a",
+                                       text_color=self.text_main)
+        self.net_text.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+        disk_card = ctk.CTkFrame(net_disk_row, fg_color=self.card_bg, corner_radius=15,
+                                 border_width=1, border_color=self.border_col)
+        disk_card.grid(row=0, column=1, padx=8, sticky="nsew")
+        disk_card.configure(height=160)
+        disk_card.grid_propagate(False)
+        ctk.CTkLabel(disk_card, text="💾 DISK PARTITIONS", font=("Orbitron", 12, "bold"),
+                     text_color=self.accent_green).pack(pady=(12, 8), anchor="w", padx=20)
+        self.disk_text = ctk.CTkTextbox(disk_card, font=("Consolas", 10), fg_color="#08080a",
+                                        text_color=self.text_main)
+        self.disk_text.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+        # System Event Log
+        log_card = ctk.CTkFrame(scroll, fg_color=self.card_bg, corner_radius=15,
+                                border_width=1, border_color=self.border_col)
+        log_card.pack(fill="x", pady=10, padx=8)
+        log_card.configure(height=160)
+        log_card.grid_propagate(False)
+        ctk.CTkLabel(log_card, text="📜 SYSTEM EVENT LOG", font=("Orbitron", 12, "bold"),
+                     text_color=self.accent_red).pack(pady=(12, 8), anchor="w", padx=20)
+        self.log_textbox = ctk.CTkTextbox(log_card, font=("Consolas", 11), fg_color="#08080a",
+                                          text_color=self.accent_green)
+        self.log_textbox.pack(fill="both", expand=True, padx=20, pady=(0, 15))
         self.log_textbox.insert("end", self._generate_initial_logs())
         self.log_textbox.configure(state="disabled")
 
@@ -544,6 +842,13 @@ class PentestAI(ctk.CTk):
         if hasattr(self, 'clock_lbl'):
             self.clock_lbl.configure(text=f"⏱️ {time.strftime('%H:%M:%S')} UTC")
         self.after(1000, self._update_clock)
+
+    def _update_uptime(self):
+        uptime_seconds = time.time() - psutil.boot_time()
+        uptime_str = format_uptime(uptime_seconds)
+        if hasattr(self, 'uptime_lbl'):
+            self.uptime_lbl.configure(text=f"Uptime: {uptime_str}")
+        self.after(60000, self._update_uptime)
 
     def _generate_initial_logs(self):
         return "\n".join([
@@ -569,23 +874,27 @@ class PentestAI(ctk.CTk):
                     net_total = psutil.net_io_counters()
                     net_mb = (net_total.bytes_sent + net_total.bytes_recv)/(1024*1024)
                     uptime = time.time() - psutil.boot_time()
-                    uptime_str = f"{int(uptime//3600)}h {int((uptime%3600)//60)}m"
+                    uptime_str = format_uptime(uptime)
                     threads = threading.active_count()
-                    # Update metric cards
                     self.metric_labels["CPU"].configure(text=f"{cpu:.1f}%")
                     self.metric_labels["RAM"].configure(text=f"{ram.percent:.1f}%")
                     self.metric_labels["DISK"].configure(text=f"{disk.percent:.1f}%")
                     self.metric_labels["NET_IO"].configure(text=f"{net_mb:.1f} MB")
                     self.metric_labels["UPTIME"].configure(text=uptime_str)
                     self.metric_labels["THREADS"].configure(text=str(threads))
-                    # Battery
+                    if "CPU" in self.metric_progress:
+                        self.metric_progress["CPU"].set(cpu/100)
+                        self.metric_progress["RAM"].set(ram.percent/100)
+                        self.metric_progress["DISK"].set(disk.percent/100)
+
                     if int(time.time()) % 6 == 0:
                         try:
                             batt = psutil.sensors_battery()
                             self.metric_labels["BATTERY"].configure(text=f"{batt.percent:.0f}%" if batt else "N/A")
+                            if "BATTERY" in self.metric_progress and batt:
+                                self.metric_progress["BATTERY"].set(batt.percent/100)
                         except:
                             self.metric_labels["BATTERY"].configure(text="N/A")
-                        # Update temperature di sidebar
                         try:
                             temp = psutil.sensors_temperatures()
                             cpu_temp = temp.get('coretemp', [{}])[0].get('current', 0) if temp else 0
@@ -595,26 +904,21 @@ class PentestAI(ctk.CTk):
                                 self.temp_label.configure(text="🌡️ TEMP: N/A")
                         except:
                             self.temp_label.configure(text="🌡️ TEMP: N/A")
-                    # Top processes setiap 5 detik
-                    if int(time.time()) % 5 == 0:
-                        procs = []
-                        for p in psutil.process_iter(['pid','name','cpu_percent','memory_percent']):
-                            try:
-                                procs.append(p.info)
-                            except: pass
-                        top_cpu = sorted(procs, key=lambda x: x['cpu_percent'] or 0, reverse=True)[:5]
-                        top_mem = sorted(procs, key=lambda x: x['memory_percent'] or 0, reverse=True)[:5]
+
+                    if int(time.time()) % 10 == 0:
+                        top = get_top_processes(5)
                         txt = "┌───── CPU TOP 5 ─────────────────────────────────────────────┐\n"
-                        for p in top_cpu:
+                        for p in top["cpu_top"]:
                             txt += f"│ {p['name'][:20]:20}  CPU: {p['cpu_percent']:5.1f}%  MEM: {p['memory_percent']:5.1f}% │\n"
                         txt += "├───── MEMORY TOP 5 ──────────────────────────────────────────┤\n"
-                        for p in top_mem:
+                        for p in top["mem_top"]:
                             txt += f"│ {p['name'][:20]:20}  CPU: {p['cpu_percent']:5.1f}%  MEM: {p['memory_percent']:5.1f}% │\n"
                         txt += "└──────────────────────────────────────────────────────────────┘"
                         self.proc_text.configure(state="normal")
                         self.proc_text.delete("1.0","end")
                         self.proc_text.insert("end", txt)
                         self.proc_text.configure(state="disabled")
+
                         alerts = []
                         if cpu > 80: alerts.append(f"⚠️ High CPU: {cpu:.1f}%")
                         if ram.percent > 90: alerts.append(f"⚠️ High RAM: {ram.percent:.1f}%")
@@ -624,25 +928,39 @@ class PentestAI(ctk.CTk):
                         self.alert_text.delete("1.0","end")
                         self.alert_text.insert("end", "\n".join(alerts))
                         self.alert_text.configure(state="disabled")
-                        net_if = psutil.net_io_counters(pernic=True)
-                        net_str = "\n".join([f"{iface}: ↑ {s.bytes_sent/1024:.1f}KB ↓ {s.bytes_recv/1024:.1f}KB" for iface,s in net_if.items() if s.bytes_sent or s.bytes_recv])
+
+                        net_if = get_network_interfaces()
+                        net_str = "\n".join([f"{iface}: ↑ {data['sent_mb']:.1f}MB ↓ {data['recv_mb']:.1f}MB" for iface, data in net_if.items()])
                         self.net_text.configure(state="normal")
                         self.net_text.delete("1.0","end")
                         self.net_text.insert("end", net_str or "No active interfaces")
                         self.net_text.configure(state="disabled")
-                        parts = []
-                        for part in psutil.disk_partitions():
-                            try:
-                                u = psutil.disk_usage(part.mountpoint)
-                                parts.append(f"{part.mountpoint}: {u.percent:.1f}% ({u.used//(1024**3)}GB/{u.total//(1024**3)}GB)")
-                            except: pass
+
+                        parts = get_disk_partitions()
+                        parts_str = "\n".join([f"{p['mount']}: {p['percent']:.1f}% ({p['used_gb']}GB/{p['total_gb']}GB)" for p in parts])
                         self.disk_text.configure(state="normal")
                         self.disk_text.delete("1.0","end")
-                        self.disk_text.insert("end", "\n".join(parts))
+                        self.disk_text.insert("end", parts_str)
                         self.disk_text.configure(state="disabled")
+
+                    if MATPLOTLIB_AVAILABLE and int(time.time()) % 5 == 0:
+                        self.cpu_history.append(cpu)
+                        if len(self.cpu_history) > 30:
+                            self.cpu_history.pop(0)
+                        self.cpu_line.set_data(range(len(self.cpu_history)), self.cpu_history)
+                        self.cpu_ax.set_xlim(0, len(self.cpu_history))
+                        self.cpu_fig.canvas.draw_idle()
+                        sizes = [ram.percent, 100-ram.percent]
+                        labels = ['Used', 'Free']
+                        colors = [self.accent_blue, self.text_dim]
+                        self.ram_ax.clear()
+                        self.ram_ax.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, startangle=90, textprops={'color': 'white'})
+                        self.ram_ax.add_artist(plt.Circle((0,0),0.7, color=self.card_bg))
+                        self.ram_fig.canvas.draw_idle()
+
                     time.sleep(3)
                 except Exception as e:
-                    print(f"Dashboard update error: {e}")
+                    logger.error(f"Dashboard update error: {e}")
                     time.sleep(3)
         threading.Thread(target=update_loop, daemon=True).start()
 
@@ -703,7 +1021,7 @@ class PentestAI(ctk.CTk):
         self._add_engine_tab(kernel_id)
         self.show_ai_page()
 
-    # ----------------------------- TERMINAL ENGINE (Multiline Input) -----------------------------
+    # ----------------------------- TERMINAL ENGINE -----------------------------
     def _build_ai_page(self):
         self.page_ai.grid_columnconfigure(0, weight=1)
         self.page_ai.grid_rowconfigure(0, weight=1)
@@ -734,6 +1052,9 @@ class PentestAI(ctk.CTk):
         self.entry.bind("<Return>", self._send_on_enter)
         self.entry.bind("<Shift-Return>", lambda e: self.entry.insert("insert", "\n") or "break")
         self.entry.bind("<KeyRelease>", self._adjust_input_height)
+        self.entry.bind("<Up>", self._history_up)
+        self.entry.bind("<Down>", self._history_down)
+        self.entry.bind("<Tab>", self._autocomplete)
 
         self.upload_btn = ctk.CTkButton(
             self.input_bar, text="📎", width=40, height=40,
@@ -770,6 +1091,33 @@ class PentestAI(ctk.CTk):
         self.entry.configure(height=new_height)
         self.input_bar.update_idletasks()
 
+    def _history_up(self, event):
+        if self.command_history and self.history_index > 0:
+            self.history_index -= 1
+            self.entry.delete("1.0", "end")
+            self.entry.insert("1.0", self.command_history[self.history_index])
+        return "break"
+
+    def _history_down(self, event):
+        if self.command_history and self.history_index < len(self.command_history) - 1:
+            self.history_index += 1
+            self.entry.delete("1.0", "end")
+            self.entry.insert("1.0", self.command_history[self.history_index])
+        elif self.history_index == len(self.command_history) - 1:
+            self.history_index = len(self.command_history)
+            self.entry.delete("1.0", "end")
+        return "break"
+
+    def _autocomplete(self, event):
+        text = self.entry.get("1.0", "end-1c").strip()
+        if text.startswith("run "):
+            cmd = text[4:]
+            matches = [tool for cat in self.network_tools.values() for (tool_name, _) in cat if tool_name.lower().startswith(cmd.lower())]
+            if matches:
+                self.entry.delete("1.0", "end")
+                self.entry.insert("1.0", f"run {matches[0]}")
+        return "break"
+
     def _fire_or_cancel(self):
         if self.is_processing:
             self._cancel_processing()
@@ -780,6 +1128,7 @@ class PentestAI(ctk.CTk):
         self.cancel_event.set()
         self._log_to_tab("[!] Processing cancelled by user.", "SYSTEM", self.engine_tabs.get())
         self._set_button_idle()
+        self.is_processing = False
 
     def _set_button_loading(self):
         self.fire_btn.configure(text="⏹️", hover_color=self.accent_red, fg_color="transparent")
@@ -803,9 +1152,12 @@ class PentestAI(ctk.CTk):
         self._adjust_input_height()
         self._log_to_tab(q, "USER", cur)
         self.save_message(cur, "user", q)
+        self.command_history.append(q)
+        self.history_index = len(self.command_history)
         self.is_processing = True
         self.cancel_event.clear()
         self._set_button_loading()
+        self._semaphore.acquire()
         threading.Thread(target=self._process_query, args=(q, cur), daemon=True).start()
 
     def _process_query(self, query, tab_key):
@@ -840,6 +1192,7 @@ class PentestAI(ctk.CTk):
         self.is_processing = False
         self.cancel_event.clear()
         self._set_button_idle()
+        self._semaphore.release()
 
     def _upload_file(self):
         cur = self.engine_tabs.get()
@@ -860,6 +1213,7 @@ class PentestAI(ctk.CTk):
         ext = os.path.splitext(name)[1].lower()
         md5 = self._calculate_md5(path)
         text_exts = {'.txt','.py','.md','.json','.csv','.log','.ini','.conf','.sh','.xml','.yaml','.yml','.js','.html','.css'}
+        image_exts = {'.png','.jpg','.jpeg','.bmp','.gif','.tiff'}
         if ext in text_exts:
             if self.chroma_collection:
                 self.add_to_knowledge_base(path, tab_key)
@@ -871,6 +1225,18 @@ class PentestAI(ctk.CTk):
             except Exception as e:
                 self._log_to_tab(f"[!] Read error: {e}", "UPLOAD", tab_key)
                 return
+        elif OCR_AVAILABLE and ext in image_exts:
+            try:
+                image = Image.open(path)
+                extracted_text = pytesseract.image_to_string(image)
+                if extracted_text.strip():
+                    self._log_to_tab(f"🖼️ OCR from {name}: {extracted_text[:500]}", "OCR", tab_key)
+                    prompt = f"User uploaded image '{name}'. Text from OCR:\n{extracted_text}\nAnalyze."
+                else:
+                    prompt = f"User uploaded image '{name}' but no text found."
+            except Exception as e:
+                self._log_to_tab(f"[!] OCR failed: {e}", "UPLOAD", tab_key)
+                prompt = f"Failed to process image '{name}': {e}"
         else:
             self._log_to_tab(f"📁 Uploaded binary: {name} ({size} bytes) MD5: {md5}", "UPLOAD", tab_key)
             prompt = f"User uploaded '{name}' (binary). Size {size} bytes. MD5 {md5}. Respond accordingly."
@@ -888,6 +1254,7 @@ class PentestAI(ctk.CTk):
         except:
             return "N/A"
 
+    # ----------------------------- TAB MANAGEMENT -----------------------------
     def _add_engine_tab(self, engine_type):
         self.engine_counts[engine_type] += 1
         label = f"{engine_type} #{self.engine_counts[engine_type]}" if self.engine_counts[engine_type]>1 else engine_type
@@ -946,7 +1313,6 @@ class PentestAI(ctk.CTk):
         self._render_network_page()
 
     def _build_toolkit(self):
-        # Toolkit lengkap (sama seperti sebelumnya, sudah diisi)
         return {
             "OSINT & INFO GATHERING": [
                 ("Whois", "whois"), ("DNSRecon", "dnsrecon -d"), ("TheHarvester", "theHarvester -d"),
@@ -1127,5 +1493,5 @@ class PentestAI(ctk.CTk):
         threading.Thread(target=mon, daemon=True).start()
 
 if __name__ == "__main__":
-    app = PentestAI()
+    app = ParrotAI()
     app.mainloop()

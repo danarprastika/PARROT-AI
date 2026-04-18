@@ -1,0 +1,7 @@
+{
+    "model": "phi3:mini",
+    "graph": true,
+    "ocr": true,
+    "vt_key": "",
+    "abuse_key": ""
+}
